@@ -35,14 +35,15 @@ export const Config = z.object({
   benchScriptPath: z.string().default(""),
   /** 默认导出任务（openvino_convert）。 */
   convertTask: z.string().default("text-generation-with-past"),
+  /** 状态端点鉴权 token（留空 = 回环免鉴权）。 */
+  token: z.string().role("secret").default(""),
 });
 
 export function apply(ctx, config) {
-  const shell = ctx.get("shell");
-  if (shell === undefined) {
-    console.log("[dsh-openvino] shell 服务不可用，插件跳过（工具不可用）");
-    return;
-  }
+  // 注意：不在此处提前 return——即使 apply 时 shell 服务尚未就绪，也要先注册工具，
+  // shell 在 execute 时经 getShell() 获取（执行时服务必然就绪）。早期 return 会静默
+  // 丢失全部工具注册（本插件曾因此整包不加载）。
+  const getShell = () => ctx.get("shell");
 
   /** 输出 schema 帮助函数：嵌套 object 需显式 additionalProperties，数组需 items。 */
   const obj = (props, additionalProperties = true) => ({ type: "object", properties: props, additionalProperties });
@@ -63,6 +64,8 @@ export function apply(ctx, config) {
       },
       timeoutMs: 90000,
       async execute(args, exec) {
+        const shell = getShell();
+        if (!shell) throw new Error("shell 服务不可用，无法执行 OpenVINO 工具");
         const python = config.pythonCmd || (await findPython(shell, exec.signal));
         if (!python) throw new Error("未找到 python（试过 py -3.12 / python / python3），无法体检 OpenVINO 环境");
         const report = await runProbe(shell, python, exec.signal);
@@ -135,6 +138,8 @@ export function apply(ctx, config) {
       },
       timeoutMs: 90000,
       async execute(args, exec) {
+        const shell = getShell();
+        if (!shell) throw new Error("shell 服务不可用，无法执行 OpenVINO 工具");
         const python = config.pythonCmd || (await findPython(shell, exec.signal));
         if (!python) throw new Error("未找到 python，无法扫描模型目录");
         const report = await runProbe(shell, python, exec.signal);
@@ -175,6 +180,8 @@ export function apply(ctx, config) {
       },
       timeoutMs: 90000,
       async execute(args, exec) {
+        const shell = getShell();
+        if (!shell) throw new Error("shell 服务不可用，无法执行 OpenVINO 工具");
         const python = config.pythonCmd || (await findPython(shell, exec.signal));
         if (!python) throw new Error("未找到 python");
         const report = await runProbe(shell, python, exec.signal);
@@ -221,6 +228,8 @@ export function apply(ctx, config) {
       },
       timeoutMs: 600000,
       async execute(args, exec) {
+        const shell = getShell();
+        if (!shell) throw new Error("shell 服务不可用，无法执行 OpenVINO 工具");
         const python = config.pythonCmd || (await findPython(shell, exec.signal));
         if (!python) throw new Error("未找到 python（基准需要 openvino_genai）");
         const probe = await runProbe(shell, python, exec.signal);
@@ -288,6 +297,8 @@ export function apply(ctx, config) {
       },
       timeoutMs: 600000,
       async execute(args, exec) {
+        const shell = getShell();
+        if (!shell) throw new Error("shell 服务不可用，无法执行 OpenVINO 工具");
         const python = config.pythonCmd || (await findPython(shell, exec.signal));
         if (!python) throw new Error("未找到 python");
         const checkCmd = `${python} -c "import importlib.util; print(bool(importlib.util.find_spec('optimum')))"`;
@@ -338,6 +349,59 @@ export function apply(ctx, config) {
   ];
 
   const disposers = tools.map((t) => ctx.tools.register(t));
+
+  // 只读状态端点（供 client 设置页卡片轮询；与兄弟插件约定一致：留空 token=回环免鉴权）
+  const webServer = ctx.get("webServer");
+  let disposeRoute = () => {};
+  if (webServer) {
+    const authToken = () => config.token || "";
+    const authorized = (req) => {
+      const st = authToken();
+      if (!st) return true;
+      try {
+        const url = new URL(req.url ?? "/", "http://localhost");
+        if (url.searchParams.get("token") === st) return true;
+        const header = req.headers?.authorization;
+        return typeof header === "string" && header === `Bearer ${st}`;
+      } catch {
+        return false;
+      }
+    };
+    disposeRoute = webServer.register({
+      kind: "exact",
+      path: "/dsh-openvino/status",
+      handler: async (req, res) => {
+        if (!authorized(req)) {
+          res.writeHead(401, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ ok: false, error: "unauthorized" }));
+          return;
+        }
+        const shell = getShell();
+        const body = { service: "dsh-openvino", ok: true, tools: tools.map((t) => t.name) };
+        if (shell) {
+          try {
+            const python = config.pythonCmd || (await findPython(shell, new AbortController().signal));
+            if (python) {
+              const report = await runProbe(shell, python, new AbortController().signal);
+              body.devices = (report.devices || []).map((d) => `${d.id}=${d.fullName || "?"}`);
+              body.openvino = report.openvino;
+              body.ovms = report.ovms;
+              body.models = (report.models || []).map((m) => ({ name: m.name, type: m.type, sizeGb: m.sizeGb }));
+            } else {
+              body.python = "not found";
+            }
+          } catch (e) {
+            body.probeError = e instanceof Error ? e.message : String(e);
+          }
+        } else {
+          body.shell = "unavailable";
+        }
+        res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify(body));
+      },
+    });
+  }
+
   ctx.effect(() => () => {
     for (const d of disposers) {
       try {
@@ -345,6 +409,11 @@ export function apply(ctx, config) {
       } catch {
         /* noop */
       }
+    }
+    try {
+      disposeRoute();
+    } catch {
+      /* noop */
     }
   });
   console.log(`[dsh-openvino] OpenVINO Toolkit loaded: ${tools.map((t) => t.name).join(", ")}`);
