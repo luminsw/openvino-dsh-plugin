@@ -18,7 +18,7 @@
  */
 import z from "@deepseek-ai/schemastery";
 import { defineTool } from "@deepseek-ai/dsh-tools";
-import { PROBE, DIR_TO_OMS, OMS_TO_DIR, findPython, runProbe, fileExists } from "./probe.js";
+import { DIR_TO_OMS, OMS_TO_DIR, findPython, runProbe, fileExists } from "./probe.js";
 
 export const name = "dsh-openvino";
 
