@@ -22,7 +22,7 @@ import { DIR_TO_OMS, OMS_TO_DIR, findPython, runProbe, fileExists } from "./prob
 
 export const name = "dsh-openvino";
 
-export const inject = ["tools"];
+export const inject = ["tools", "webServer"];
 
 export const Config = z.object({
   /** 模型目录（默认自动探测 BAIHUA_HOME/models，其次 ~/.baihua/models、~/.openclaw/models）。 */
@@ -351,7 +351,7 @@ export function apply(ctx, config) {
   const disposers = tools.map((t) => ctx.tools.register(t));
 
   // 只读状态端点（供 client 设置页卡片轮询；与兄弟插件约定一致：留空 token=回环免鉴权）
-  const webServer = ctx.get("webServer");
+  const webServer = ctx.webServer;
   let disposeRoute = () => {};
   if (webServer) {
     const authToken = () => config.token || "";
