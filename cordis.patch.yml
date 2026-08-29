@@ -1,0 +1,12 @@
+# openvino-dsh-plugin 组合包 patch：注册 OpenVINO / Intel GPU 运维工具集到 DSH。
+#
+# 安装本包（dsh plugin --profile web add github:luminsw/openvino-dsh-plugin）后，
+# profile 组合（dsh.profile.bundles）会自动应用本层；如需调整，在 profile 自己的
+# cordis.patch.yml 里按 id 覆盖 config（后应用的层按行胜出）：
+#   - id: dsh-openvino
+#     config:
+#       modelsDir: C:/Users/me/.baihua/models
+
+- insert:
+    - id: dsh-openvino
+      name: openvino-dsh-plugin
