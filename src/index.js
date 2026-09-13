@@ -241,9 +241,12 @@ export function apply(ctx, config) {
         const devices = Array.isArray(args.devices) && args.devices.length ? args.devices : ["CPU"];
         let script = args.scriptPath || config.benchScriptPath;
         if (!script) {
+          const os = await import("os");
+          const home = os.default.homedir();
+          const baihuaHome = process.env.BAIHUA_HOME || home;
           const cands = [
-            "C:/Users/lumin/src/baihua/scripts/openvino_benchmark.py",
-            "C:/Users/lumin/.baihua/scripts/openvino_benchmark.py",
+            `${baihuaHome}/scripts/openvino_benchmark.py`,
+            `${home}/.baihua/scripts/openvino_benchmark.py`,
           ];
           for (const c of cands) {
             if (await fileExists(shell, python, c, exec.signal)) {
@@ -253,7 +256,7 @@ export function apply(ctx, config) {
           }
         }
         if (!script) {
-          throw new Error("未找到 openvino_benchmark.py，请传 scriptPath（仓库在 C:/Users/lumin/src/baihua/scripts/openvino_benchmark.py）");
+          throw new Error("未找到 openvino_benchmark.py，请传 scriptPath（或设置 BAIHUA_HOME 环境变量指向百花安装目录）");
         }
         const repeats = Math.max(1, Number(args.repeats) || 1);
         const cmd =
@@ -310,7 +313,9 @@ export function apply(ctx, config) {
           /* not installed */
         }
         const name = String(args.hfModelId || "").split("/").pop() || "model";
-        const base = "C:/Users/lumin/.baihua/models";
+        const os = await import("os");
+        const home = os.default.homedir();
+        const base = args.outputDir ? "" : (process.env.BAIHUA_HOME ? `${process.env.BAIHUA_HOME}/models` : `${home}/.baihua/models`);
         const outDir = args.outputDir || `${base}/${name}-${args.weightFormat || "int4"}-ov`;
         const task = args.task || config.convertTask;
         const wf = args.weightFormat || "int4";
