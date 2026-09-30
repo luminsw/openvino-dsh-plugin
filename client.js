@@ -26,7 +26,11 @@ window.__ModuleLoader__.load({
       padding: "14px 16px",
     };
 
-    function OpenVinoStatusCard() {
+    function OpenVinoStatusCard(props) {
+      // summary 只用于行描述兜底（bundle 配置页只渲染 page）
+      if (props.view === "summary") {
+        return React.createElement("span", null, "本机 Intel GPU / OpenVINO 环境状态（openvino_env_diag 等工具）");
+      }
       const [status, setStatus] = useState(null);
       const [error, setError] = useState(null);
 
@@ -107,12 +111,13 @@ window.__ModuleLoader__.load({
       name: "dsh-openvino-client",
       inject: ["slots"],
       apply(ctx) {
-        ctx.slots.inject("settings.plugin.item", function* () {
+        // DSH 0.2.x：卡片挂在「插件」页里本 bundle 自己的页面上
+        // （plugins.bundle.config，key = 包名）；旧版 settings.plugin.item 槽位已删除。
+        ctx.slots.inject("plugins.bundle.config", function* () {
           yield ctx.slots.register(
             {
-              name: "settings.plugin.item",
-              key: "dsh-openvino",
-              locale: "settings.dsh-openvino",
+              name: "plugins.bundle.config",
+              key: "openvino-dsh-plugin",
             },
             OpenVinoStatusCard
           );
