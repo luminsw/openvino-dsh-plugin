@@ -87,7 +87,12 @@ window.__ModuleLoader__.load({
         }
         rows.push(["OVMS 注册", Array.isArray(status.ovms) ? status.ovms.join(", ") : String(status.ovms || "")]);
         rows.push(["模型", (status.models || []).map((m) => `${m.name} [${m.type}]`).join("，") || "无"]);
-        if (status.python === "not found") rows.push(["python", "未找到（工具不可用）"]);
+        // python 字段有三种形态：字符串（解析到的命令）、{found:false,...}、旧版 "not found" 哨兵
+        if (typeof status.python === "string") {
+          rows.push(["python", status.python === "not found" ? "未找到（工具不可用）" : status.python]);
+        } else if (status.python && status.python.found === false) {
+          rows.push(["python", `未找到（试过 ${(status.python.tried || []).length} 个候选）`]);
+        }
         if (status.shell === "unavailable") rows.push(["shell", "不可用"]);
         if (status.probeError) rows.push(["探测错误", status.probeError]);
         body = React.createElement(
