@@ -49,16 +49,49 @@ dsh plugin --profile web add github:luminsw/openvino-dsh-plugin
 ## 验证
 
 ```bash
-# 独立冒烟（不需要 DSH 上下文；需本机 python + openvino）
+# 独立冒烟（不需要 DSH 上下文；没有 python 也能跑原生段）
 node scripts/smoke.mjs
 ```
 
 DSH 里直接调用工具即可，例如 `openvino_env_diag`（体检）、`openvino_status`（状态判定）、
 `openvino_convert`（转换，dry-run 默认）。
 
+## 0.2.0 变更：DSH 0.2.x 适配 + 摆脱 python 依赖
+
+起因：`openvino_status` 报「未找到 python」，但本机明明装了三个 python。排查出三层原因，逐层都改了：
+
+1. **`ctx.shell` 没有 `run()`**。当前契约是 `resolve()` + `execute()`（`execute` 返回 handle，
+   `await handle.result()` 拿 `{exitCode, stdout, stderr}`）。旧代码 6 处 `shell.run(...)` 全会抛
+   `TypeError`，而 `findPython` 把它吞进 `try/catch`，于是"API 不兼容"被伪装成"没有 python"。
+   现在统一走 `runShell()`，并且 **shell API 故障一律如实抛出**，不再降级成"缺 python"。
+2. **状态查询不该依赖 python**。新增 `src/native.js`：OVMS 注册走 HTTP（`/v1/models`、`/v1/config`，
+   顺带拿到每个模型的 state）、模型目录走 `node:fs`、映射表本来就在 JS 里。
+   `openvino_status` / `openvino_models_scan` / `openvino_env_diag` 的核心结论**不再需要 python**；
+   只有设备与版本这类非 python 给不出的信息会降级为"未安装 bindings，仅此信息受影响"。
+3. **`findPython` 探测面太窄**。现在顺序是：`config.pythonCmd` → `OPENVINO_PYTHON` →
+   宿主 PATH 上解析出的绝对路径（DSH shell 的 PATH 可能与宿主进程不同，实测本机 `python`
+   在宿主 PATH 上却在 shell 里解析不到）→ 常见安装位置 → `py -0p` / `where python` → 字面命令。
+   失败原因去重后最多留几条，不再把同一段沙箱报错拼七遍。
+
+顺带修的两个真实误报：
+
+- **模型分类**：OVMS 的 IR 放在 `<模型>/1/openvino_*.xml` 版本子目录里，只查顶层会把
+  `Qwen3-4B` 判成 other、把 `Qwen3.5-4B`（含 vision embeddings）判成 LLM。现在递归一层收集 IR，
+  按 VL 产物 > 目录名 embedding 线索 > `openvino_language_model.xml` > architectures > 文本 tokenizer
+  的顺序判定，单文件 IR 且没有 tokenizer 的（如 TTS Kokoro）归 other。
+- **dtype**：`openvino_config.json` 通常不存在，改为回退解析目录名（`-int4-ov` / `-int8-ov`）。
+
+`openvino_convert` 的 dry-run 现在**不需要可用的 python** 也会给出正确命令（只是标注 python 未验证）。
+
 ## 已知限制与约定
 
-- 工具依赖本机 `python`（openvino / openvino_genai / optimum 按需），未安装时给出明确指引。
+- `openvino_bench` / `openvino_convert --dryRun=false` 需要可用 python（`openvino_genai` / `optimum`）。
+  状态类工具不需要。
+- **DSH shell 沙箱可能整体拒绝执行命令**：错误形如
+  `sandbox mode "workspace-write" ... Windows ACL temp root must be outside the workspace`，
+  即 TEMP 目录落在 workspace 里面（本机曾因 workspace = `C:\Users\lumin`、TEMP 在其下而全部被拒）。
+  这是宿主环境问题，插件只能如实报出原因：此时状态类工具照常可用，bench/convert 会失败并显示该原因。
+  修法二选一 —— 把 DSH workspace 收窄到具体项目目录，或把 `TEMP`/`TMP` 指到 workspace 之外的目录后重启 DSH。
 - 模型目录 ↔ OVMS id 映射表 `DIR_TO_OMS`（`src/probe.js`）与百花 `OmsModelMap.cs` 保持一致，新增模型需两个方向同步。
 - 模型目录文件被 ACL 保护（如 `PermissionError`）时，先 `icacls "<dir>" /grant "<user>:(OI)(CI)F" /T` 修复。
 - `openvino_bench` 加载 7B 模型较耗时（1-5 分钟），属长任务。

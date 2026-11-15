@@ -18,7 +18,8 @@
  */
 import z from "@deepseek-ai/schemastery";
 import { defineTool } from "@deepseek-ai/dsh-tools";
-import { DIR_TO_OMS, OMS_TO_DIR, findPython, runProbe, fileExists } from "./probe.js";
+import { DIR_TO_OMS, OMS_TO_DIR, findPython, runProbe, hasModule, runShell, fileExists } from "./probe.js";
+import { fetchOvms, findModelsDir, scanModels } from "./native.js";
 
 export const name = "dsh-openvino";
 
@@ -63,36 +64,52 @@ export function apply(ctx, config) {
         render: (_args, v) => [{ type: "text", text: v.summary }],
       },
       timeoutMs: 90000,
-      async execute(args, exec) {
+      async execute(_args, exec) {
+        // 设备/版本只有 python 能给；OVMS 注册与模型目录走纯 Node，缺 python 也照常出结论。
         const shell = getShell();
-        if (!shell) throw new Error("shell 服务不可用，无法执行 OpenVINO 工具");
-        const python = config.pythonCmd || (await findPython(shell, exec.signal));
-        if (!python) throw new Error("未找到 python（试过 py -3.12 / python / python3），无法体检 OpenVINO 环境");
-        const report = await runProbe(shell, python, exec.signal);
+        const modelsDir = findModelsDir(config.modelsDir);
+        const models = scanModels(modelsDir);
+        const ovms = await fetchOvms(config.ovmsUrl, exec.signal);
+
+        let pythonReport = null;
+        let pythonError = null;
+        if (shell) {
+          const probe = await findPython(shell, exec.signal, config);
+          if (probe.python) {
+            try {
+              pythonReport = await runProbe(shell, probe.python, exec.signal);
+            } catch (error) {
+              pythonError = error instanceof Error ? error.message : String(error);
+            }
+          } else {
+            pythonError = `未找到 python（试过 ${probe.tried.join(" / ")}）`;
+          }
+        } else {
+          pythonError = "shell 服务不可用";
+        }
+
+        const devices = pythonReport?.devices ?? [];
+        const openvino = pythonReport?.openvino ?? (pythonError ? { error: pythonError } : {});
         const fixes = [];
-        if (report.openvino && report.openvino.error) {
-          fixes.push(`openvino 无法导入: ${report.openvino.error}（需 pip install openvino openvino-genai）`);
-        }
-        if (report.devices && !report.devices.length) fixes.push("OpenVINO 未枚举到任何设备，检查 openvino 安装");
-        const npu = (report.devices || []).some((d) => d.id === "NPU");
-        if (!npu && (report.devices || []).length) {
-          fixes.push("未检测到 NPU：Intel AI Boost 需要 NPU 驱动（Intel NPU Driver / IPU6）与最新 openvino，驱动缺失时设备不可见");
-        }
-        const oms = report.ovms;
-        if (Array.isArray(oms) && !oms.length) {
-          fixes.push(`OVMS(:8000) 在跑但未注册任何模型：检查 ${report.modelsDir || "BAIHUA_HOME/models"}/config.json`);
-        }
-        if (oms && oms.error) {
+        if (openvino.error) {
           fixes.push(
-            `OVMS(:8000) 未运行/不可达 (${oms.error})：Windows 用管理员运行 scripts/install-openvino-ovms-service.ps1，Linux 起 openvino pod；模型已下载但未注册时先 ovms --configure`,
+            `openvino python 包不可用（${openvino.error}）：pip install openvino openvino-genai。` +
+              "状态与模型扫描不依赖它，只有设备/版本信息受影响",
           );
         }
-        if (Array.isArray(oms) && report.models) {
-          const registered = new Set(oms);
-          const missing = report.models.filter((m) => {
-            const oid = DIR_TO_OMS[m.name];
-            return oid && !registered.has(oid);
-          });
+        const npu = devices.some((d) => d.id === "NPU");
+        if (devices.length && !npu) {
+          fixes.push("未检测到 NPU：Intel AI Boost 需要 NPU 驱动（Intel NPU Driver / IPU6）与最新 openvino，驱动缺失时设备不可见");
+        }
+        if (ovms.error) {
+          fixes.push(
+            `OVMS(${config.ovmsUrl}) 未运行/不可达 (${ovms.error})：Windows 用管理员运行 scripts/install-openvino-ovms-service.ps1，Linux 起 openvino pod；模型已下载但未注册时先 ovms --configure`,
+          );
+        } else if (!ovms.ids.length) {
+          fixes.push(`OVMS 在跑但未注册任何模型：检查 ${modelsDir || "BAIHUA_HOME/models"}/config.json`);
+        }
+        if (!ovms.error && models.length) {
+          const missing = models.filter((m) => DIR_TO_OMS[m.name] && !ovms.ids.includes(DIR_TO_OMS[m.name]));
           if (missing.length) {
             fixes.push(
               "以下模型已下载但未注册 OVMS：" +
@@ -102,15 +119,20 @@ export function apply(ctx, config) {
           }
         }
         if (!fixes.length) fixes.push("环境健康：无需修复");
-        const devLine = (report.devices || []).map((d) => `${d.id}=${d.fullName || "?"}`).join(" | ");
-        const omsLine = Array.isArray(oms) ? oms.join(", ") : String(oms.error || "");
+        const devLine = devices.map((d) => `${d.id}=${d.fullName || "?"}`).join(" | ");
+        const omsLine = ovms.error ? ovms.error : ovms.ids.join(", ");
         const summary =
-          `设备: ${devLine || "无"}\n` +
-          `openvino: ${report.openvino?.version || "?"} / genai: ${report.openvino?.genai || "?"}\n` +
+          `设备: ${devLine || (openvino.error ? "未知（openvino python 包未安装）" : "无")}\n` +
+          `openvino: ${openvino.version || "?"} / genai: ${openvino.genai || "?"}\n` +
           `OVMS 注册模型: ${omsLine || "无"}\n` +
-          `模型目录: ${report.modelsDir || "未找到"}（${(report.models || []).length} 个）\n` +
+          `模型目录: ${modelsDir || "未找到"}（${models.length} 个）\n` +
+          `python: ${pythonReport?.platform?.python ?? "未使用"}\n` +
           `建议: ${fixes.join("；")}`;
-        return { summary, report, fixes };
+        return {
+          summary,
+          report: { openvino, devices, ovms, modelsDir, models, platform: pythonReport?.platform ?? null },
+          fixes,
+        };
       },
     }),
 
@@ -138,26 +160,15 @@ export function apply(ctx, config) {
       },
       timeoutMs: 90000,
       async execute(args, exec) {
-        const shell = getShell();
-        if (!shell) throw new Error("shell 服务不可用，无法执行 OpenVINO 工具");
-        const python = config.pythonCmd || (await findPython(shell, exec.signal));
-        if (!python) throw new Error("未找到 python，无法扫描模型目录");
-        const report = await runProbe(shell, python, exec.signal);
-        const modelsDir = args.modelsDir || config.modelsDir || report.modelsDir;
-        const models = (report.models || []).map((m) => {
-          const oid = DIR_TO_OMS[m.name];
-          const registered = Array.isArray(report.ovms) && oid ? report.ovms.includes(oid) : null;
-          return {
-            name: m.name,
-            type: m.type,
-            dtype: m.dtype || null,
-            arch: m.arch || null,
-            sizeGb: m.sizeGb,
-            omsId: oid || null,
-            registered,
-          };
+        // 纯 Node：目录扫描 + OVMS 注册，不再需要 python。
+        const modelsDir = findModelsDir(args.modelsDir || config.modelsDir);
+        const ovms = await fetchOvms(config.ovmsUrl, exec.signal);
+        const registered = new Set(ovms.ids);
+        const models = scanModels(modelsDir).map((m) => {
+          const oid = DIR_TO_OMS[m.name] ?? null;
+          return { ...m, omsId: oid, registered: oid ? registered.has(oid) : ovms.error ? null : false };
         });
-        return { models, modelsDir };
+        return { models, modelsDir: modelsDir ?? "", ovmsError: ovms.error ?? null };
       },
     }),
 
@@ -179,36 +190,43 @@ export function apply(ctx, config) {
         ],
       },
       timeoutMs: 90000,
-      async execute(args, exec) {
-        const shell = getShell();
-        if (!shell) throw new Error("shell 服务不可用，无法执行 OpenVINO 工具");
-        const python = config.pythonCmd || (await findPython(shell, exec.signal));
-        if (!python) throw new Error("未找到 python");
-        const report = await runProbe(shell, python, exec.signal);
-        const oms = Array.isArray(report.ovms) ? report.ovms : [];
-        const omsSet = new Set(oms);
-        const dirSet = new Set((report.models || []).map((m) => m.name));
-        const rows = (report.models || []).map((m) => {
-          const oid = DIR_TO_OMS[m.name];
+      async execute(_args, exec) {
+        // 纯 Node：OVMS /v1/models + /v1/config ↔ 本地目录 ↔ OmsModelMap，不需要 python。
+        const modelsDir = findModelsDir(config.modelsDir);
+        const models = scanModels(modelsDir);
+        const ovms = await fetchOvms(config.ovmsUrl, exec.signal);
+        const omsSet = new Set(ovms.ids);
+        const dirSet = new Set(models.map((m) => m.name));
+        const rows = models.map((m) => {
+          const oid = DIR_TO_OMS[m.name] ?? null;
           const registered = oid ? omsSet.has(oid) : false;
+          const state = oid ? (ovms.states?.[oid] ?? null) : null;
           return {
             name: m.name,
             type: m.type,
-            omsId: oid || null,
+            dtype: m.dtype,
+            sizeGb: m.sizeGb,
+            omsId: oid,
             installed: true,
             registered,
             running: registered, // OVMS 注册即运行中（懒加载语义）
-            status: registered ? "运行中（OVMS 已注册）" : "已下载未注册",
+            state,
+            status: registered ? `运行中（OVMS 已注册${state ? `，${state}` : ""}）` : "已下载未注册",
           };
         });
         const anomalies = [];
-        for (const oid of oms) {
+        for (const oid of ovms.ids) {
           const dir = OMS_TO_DIR[oid];
           if (dir && !dirSet.has(dir)) anomalies.push(`OVMS 注册了 ${oid} 但目录 ${dir} 缺失`);
           if (!dir) anomalies.push(`OVMS 注册了未知模型 id: ${oid}（不在 OmsModelMap）`);
         }
-        if (!oms.length) anomalies.push("OVMS(:8000) 未注册任何模型（服务未运行或 config.json 为空）");
-        return { rows, anomalies };
+        const unregistered = models.filter((m) => DIR_TO_OMS[m.name] && !omsSet.has(DIR_TO_OMS[m.name]));
+        if (!ovms.error && unregistered.length) {
+          anomalies.push(`已下载未注册 OVMS：${unregistered.map((m) => m.name).join("、")}`);
+        }
+        if (ovms.error) anomalies.push(`OVMS(${config.ovmsUrl}) 不可达：${ovms.error}`);
+        else if (!ovms.ids.length) anomalies.push("OVMS 未注册任何模型（服务未运行或 config.json 为空）");
+        return { rows, anomalies, modelsDir };
       },
     }),
 
@@ -230,26 +248,38 @@ export function apply(ctx, config) {
       async execute(args, exec) {
         const shell = getShell();
         if (!shell) throw new Error("shell 服务不可用，无法执行 OpenVINO 工具");
-        const python = config.pythonCmd || (await findPython(shell, exec.signal));
-        if (!python) throw new Error("未找到 python（基准需要 openvino_genai）");
-        const probe = await runProbe(shell, python, exec.signal);
-        const modelsDir = probe.modelsDir;
-        if (!modelsDir) throw new Error("未找到模型目录（BAIHUA_HOME/models 等）");
-        const llm = (probe.models || []).find((m) => m.type === "LLM");
+        const found = await findPython(shell, exec.signal, config);
+        if (!found.python) {
+          throw new Error(
+            `未找到 python（试过 ${found.tried.join(" / ")}）` +
+              (found.errors.length ? `；失败原因：${found.errors.join(" | ")}` : ""),
+          );
+        }
+        const python = found.python;
+        if (!(await hasModule(shell, python, "openvino_genai", exec.signal))) {
+          throw new Error(
+            `当前 python（${python}）没有 openvino_genai，基准测试跑不了：pip install openvino-genai；` +
+              "或在本插件 config.pythonCmd 指定装了 bindings 的解释器",
+          );
+        }
+        const modelsDir = findModelsDir(config.modelsDir);
+        if (!modelsDir) throw new Error("未找到模型目录（BAIHUA_HOME/models 等），可用 config.modelsDir 指定");
+        const scanned = scanModels(modelsDir);
+        const llm = scanned.find((m) => m.type === "LLM");
         const models = Array.isArray(args.models) && args.models.length ? args.models : llm ? [llm.name] : [];
         if (!models.length) throw new Error("模型目录下没有 LLM 模型，请显式传 models");
         const devices = Array.isArray(args.devices) && args.devices.length ? args.devices : ["CPU"];
         let script = args.scriptPath || config.benchScriptPath;
         if (!script) {
-          const os = await import("os");
-          const home = os.default.homedir();
+          const os = await import("node:os");
+          const home = os.homedir();
           const baihuaHome = process.env.BAIHUA_HOME || home;
           const cands = [
             `${baihuaHome}/scripts/openvino_benchmark.py`,
             `${home}/.baihua/scripts/openvino_benchmark.py`,
           ];
           for (const c of cands) {
-            if (await fileExists(shell, python, c, exec.signal)) {
+            if (fileExists(c)) {
               script = c;
               break;
             }
@@ -262,12 +292,12 @@ export function apply(ctx, config) {
         const cmd =
           `${python} ${JSON.stringify(script)} --models ${models.map((m) => JSON.stringify(m)).join(" ")} ` +
           `--devices ${devices.map((d) => JSON.stringify(d)).join(" ")} --repeats ${repeats}`;
-        const r = await shell.run(shell.resolve({
+        const r = await runShell(shell, {
           command: cmd,
           timeoutMs: 580000,
           stdoutMaxBytes: 4000000,
           signal: exec.signal,
-        }));
+        });
         if (r.exitCode !== 0) throw new Error(`基准失败: ${r.stderr.text || r.stdout.text || `exit ${r.exitCode}`}`);
         const out = r.stdout.text;
         const m = /\{[\s\S]*\}/.exec(out);
@@ -301,48 +331,52 @@ export function apply(ctx, config) {
       timeoutMs: 600000,
       async execute(args, exec) {
         const shell = getShell();
-        if (!shell) throw new Error("shell 服务不可用，无法执行 OpenVINO 工具");
-        const python = config.pythonCmd || (await findPython(shell, exec.signal));
-        if (!python) throw new Error("未找到 python");
-        const checkCmd = `${python} -c "import importlib.util; print(bool(importlib.util.find_spec('optimum')))"`;
-        let hasOptimum = false;
-        try {
-          const r = await shell.run(shell.resolve({ command: checkCmd, timeoutMs: 20000, signal: exec.signal }));
-          hasOptimum = r.exitCode === 0 && r.stdout.text.trim().includes("True");
-        } catch {
-          /* not installed */
-        }
+        const found = shell ? await findPython(shell, exec.signal, config) : { python: null, tried: [], errors: ["shell 服务不可用"] };
+        // dry-run 只是生成命令：python 验证不到也照样给出结论，真正执行时才强制要求。
+        const python = found.python ?? "python";
+        const hasOptimum = found.python ? await hasModule(shell, found.python, "optimum", exec.signal) : false;
         const name = String(args.hfModelId || "").split("/").pop() || "model";
-        const os = await import("os");
-        const home = os.default.homedir();
-        const base = args.outputDir ? "" : (process.env.BAIHUA_HOME ? `${process.env.BAIHUA_HOME}/models` : `${home}/.baihua/models`);
+        const os = await import("node:os");
+        const home = os.homedir();
+        const base = args.outputDir ? "" : process.env.BAIHUA_HOME ? `${process.env.BAIHUA_HOME}/models` : `${home}/.baihua/models`;
         const outDir = args.outputDir || `${base}/${name}-${args.weightFormat || "int4"}-ov`;
         const task = args.task || config.convertTask;
         const wf = args.weightFormat || "int4";
         const command =
           `${python} -m optimum.cli export openvino --model ${JSON.stringify(args.hfModelId)} --task ${task} ` +
           `--weight-format ${wf} ${JSON.stringify(outDir)}`;
+        const pythonNotes = found.python
+          ? ""
+          : `未能验证 python（${found.errors.slice(0, 2).join("；") || "未找到"}），命令里的 python 需自行确认`;
         if (args.dryRun !== false) {
           return {
-            check: { hasOptimum },
+            check: { hasOptimum, python: found.python, pythonVerified: Boolean(found.python) },
             command,
             outputDir: outDir,
             executed: false,
             verified: {},
-            note: hasOptimum ? "" : "未检测到 optimum/optimum-intel：pip install optimum[openvino]（含 NNCF）。",
+            note: hasOptimum
+              ? pythonNotes
+              : `未检测到 optimum/optimum-intel：pip install optimum[openvino]（含 NNCF）。${pythonNotes}`,
           };
         }
+        if (!found.python) {
+          throw new Error(
+            `无法执行导出：没有可用的 python（试过 ${found.tried.join(" / ") || "无候选"}）` +
+              (found.errors.length ? `；失败原因：${found.errors.slice(0, 3).join(" | ")}` : ""),
+          );
+        }
         if (!hasOptimum) throw new Error('未安装 optimum[openvino]，无法执行导出：pip install "optimum[openvino]"');
-        const r = await shell.run(shell.resolve({
+        const r = await runShell(shell, {
           command,
           timeoutMs: 580000,
           stdoutMaxBytes: 4000000,
           signal: exec.signal,
-        }));
+        });
         if (r.exitCode !== 0) throw new Error(`导出失败: ${r.stderr.text || r.stdout.text || `exit ${r.exitCode}`}`);
         const ver = {};
         for (const f of ["openvino_model.xml", "openvino_language_model.xml", "openvino_config.json"]) {
-          ver[f] = await fileExists(shell, python, `${outDir}/${f}`, exec.signal);
+          ver[f] = fileExists(`${outDir}/${f}`);
         }
         ver.ok = !!(ver["openvino_model.xml"] || ver["openvino_language_model.xml"]);
         if (!ver.ok) {
@@ -383,23 +417,36 @@ export function apply(ctx, config) {
         }
         const shell = getShell();
         const body = { service: "dsh-openvino", ok: true, tools: tools.map((t) => t.name) };
-        if (shell) {
-          try {
-            const python = config.pythonCmd || (await findPython(shell, new AbortController().signal));
-            if (python) {
-              const report = await runProbe(shell, python, new AbortController().signal);
+        const routeSignal = new AbortController().signal;
+        try {
+          // 核心状态走纯 Node：即使本机没有 openvino python 包也能给出结论。
+          const modelsDir = findModelsDir(config.modelsDir);
+          const models = scanModels(modelsDir);
+          const ovms = await fetchOvms(config.ovmsUrl, routeSignal);
+          body.ovms = ovms.error ? { error: ovms.error } : ovms.ids;
+          body.modelsDir = modelsDir;
+          body.models = models.map((m) => ({
+            name: m.name,
+            type: m.type,
+            sizeGb: m.sizeGb,
+            registered: DIR_TO_OMS[m.name] ? ovms.ids.includes(DIR_TO_OMS[m.name]) : null,
+          }));
+          const shell = getShell();
+          if (shell) {
+            const found = await findPython(shell, routeSignal, config);
+            if (found.python) {
+              const report = await runProbe(shell, found.python, routeSignal);
+              body.python = found.python;
               body.devices = (report.devices || []).map((d) => `${d.id}=${d.fullName || "?"}`);
               body.openvino = report.openvino;
-              body.ovms = report.ovms;
-              body.models = (report.models || []).map((m) => ({ name: m.name, type: m.type, sizeGb: m.sizeGb }));
             } else {
-              body.python = "not found";
+              body.python = { found: false, tried: found.tried, errors: found.errors };
             }
-          } catch (e) {
-            body.probeError = e instanceof Error ? e.message : String(e);
+          } else {
+            body.shell = "unavailable";
           }
-        } else {
-          body.shell = "unavailable";
+        } catch (e) {
+          body.probeError = e instanceof Error ? e.message : String(e);
         }
         res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
         res.end(JSON.stringify(body));

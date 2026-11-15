@@ -1,7 +1,7 @@
 {
   "name": "openvino-dsh-plugin",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "OpenVINO / Intel GPU toolkit plugin for DeepSeek Harness. One-click environment diagnostics (CPU/GPU/NPU devices, openvino_genai versions, OVMS status), local model directory scanning, unified OVMS-registered vs installed vs running status judgement, benchmark (openvino_benchmark.py wrapper), and HF→OpenVINO INT4 conversion with the correct quantization posture (NNCF via optimum-cli --weight-format int4) plus artifact verification.",
   "type": "module",
   "main": "src/index.js",
