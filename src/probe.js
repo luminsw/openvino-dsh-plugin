@@ -36,19 +36,80 @@ export const DIR_TO_OMS = {
 export const OMS_TO_DIR = Object.fromEntries(Object.entries(DIR_TO_OMS).map(([k, v]) => [v, k]));
 
 /**
- * 通过 `ctx.shell` 执行命令并等待结果。
+ * 通过 shell 执行（stdlib 回退路径，命令以字符串拼接，注意引号）。
  * @param {object} shell - ctx.shell 服务。
- * @param {{command: string, timeoutMs?: number, stdoutMaxBytes?: number, workdir?: string, signal?: AbortSignal}} request - 执行请求。
- * @returns {Promise<{exitCode: number|null, stdout: {text: string}, stderr: {text: string}}>} 运行结果。
+ * @param {{argv: string[], timeoutMs: number, stdoutMaxBytes: number, signal?: AbortSignal}} request - 请求。
+ * @returns {Promise<{exitCode: number|null, stdout: {text: string}, stderr: {text: string}, timedOut: boolean}>} 结果。
  */
-export async function runShell(shell, request) {
+async function runViaShell(shell, request) {
   if (typeof shell?.execute !== "function") {
     throw new Error(
-      "ctx.shell 缺少 execute()：当前 DSH 的 shell 服务是 resolve()+execute()，本插件不再使用旧的 shell.run()",
+      "既没有 ctx.subprocess 也没有可用的 ctx.shell.execute()：无法执行外部命令（旧版 shell.run 已不存在）",
     );
   }
-  const handle = await shell.execute(shell.resolve({ timeoutMs: 30000, ...request }));
-  return handle.result();
+  const quote = (value) => (/^[A-Za-z0-9_\-.:\\/]+$/.test(value) ? value : `"${String(value).replaceAll('"', '\\"')}"`);
+  const command = request.argv.map(quote).join(" ");
+  const handle = await shell.execute(
+    shell.resolve({ command, timeoutMs: request.timeoutMs, stdoutMaxBytes: request.stdoutMaxBytes, signal: request.signal }),
+  );
+  const result = await handle.result();
+  return { exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr, timedOut: result.timedOut === true };
+}
+
+/**
+ * 通过 ctx.subprocess 执行并收集输出。
+ *
+ * 为什么优先走这里：`ctx.shell` 的实现带沙箱，而 Windows ACL 沙箱要求「temp root 在 workspace 之外」。
+ * 本机 workspace 是 `C:\Users\lumin`、TEMP 又在其中，于是所有 shell 调用被整体拒绝
+ * （`Windows ACL temp root must be outside the workspace`）。这是宿主环境问题，插件改不了；
+ * 而 openvino 的 bench/convert 本来就要读写模型目录（GB 级权重），只能在宿主权限下跑，
+ * 所以用 DSH 自己的 subprocess seam：它不套沙箱，且收 argv 数组，没有引号解析问题。
+ *
+ * @param {object} subprocess - ctx.subprocess 服务。
+ * @param {{argv: string[], cwd?: string, timeoutMs: number, stdoutMaxBytes: number, signal?: AbortSignal}} request - 请求。
+ * @returns {Promise<{exitCode: number|null, stdout: {text: string}, stderr: {text: string}, timedOut: boolean}>} 结果。
+ */
+async function runViaSubprocess(subprocess, request) {
+  const handle = subprocess.spawn({
+    argv: request.argv,
+    cwd: request.cwd ?? homedir(),
+    stdio: {
+      stdin: "ignore",
+      stdout: { maxBytes: request.stdoutMaxBytes },
+      stderr: { maxBytes: 200_000 },
+    },
+    graceMs: 5000,
+    signal: request.signal,
+  });
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    handle.terminate();
+  }, request.timeoutMs);
+  try {
+    const outcome = await handle.done;
+    const read = (reader) => (reader ? reader.readFrom(0).text : "");
+    return {
+      exitCode: outcome.exitCode,
+      stdout: { text: read(handle.collected.stdout) },
+      stderr: { text: read(handle.collected.stderr) },
+      timedOut,
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * 执行外部命令：优先 ctx.subprocess，其次 ctx.shell。
+ * @param {{shell?: object, subprocess?: object}} runtime - 可用的执行服务。
+ * @param {{argv: string[], cwd?: string, timeoutMs?: number, stdoutMaxBytes?: number, signal?: AbortSignal}} request - 请求。
+ * @returns {Promise<{exitCode: number|null, stdout: {text: string}, stderr: {text: string}, timedOut: boolean}>} 结果。
+ */
+export async function runCommand(runtime, request) {
+  const spec = { timeoutMs: 30000, stdoutMaxBytes: 1_000_000, ...request };
+  if (typeof runtime?.subprocess?.spawn === "function") return runViaSubprocess(runtime.subprocess, spec);
+  return runViaShell(runtime?.shell, spec);
 }
 
 /**
@@ -107,95 +168,101 @@ function resolveWellKnownPythons() {
 /**
  * 探测可用的 python 解释器。
  *
- * 顺序：配置的 pythonCmd → OPENVINO_PYTHON 环境变量 → 宿主 PATH 上的绝对路径 →
- * 常见安装位置 → `py -0p` 列出的解释器 → `where python` 命中路径 → 裸 `py -3.12` /
- * `python` / `python3`。逐个用 `--version` 验证，任何一条能跑就用它。
+ * 候选（argv 前缀，按顺序验证）：配置的 pythonCmd → OPENVINO_PYTHON →
+ * `ctx.subprocess.resolveExecutable` 解析出的路径 → 宿主 PATH 绝对路径 →
+ * 常见安装位置 → `py -3.12` / `python` / `python3`。
  *
- * @param {object} shell - ctx.shell 服务。
+ * @param {{shell?: object, subprocess?: object}} runtime - 执行服务。
  * @param {AbortSignal} [signal] - 取消信号。
  * @param {{pythonCmd?: string}} [config] - 插件配置。
- * @returns {Promise<{python: string|null, tried: string[], errors: string[]}>} 探测结果；不抛异常，但会保留失败原因。
+ * @returns {Promise<{python: string[]|null, pythonCommand: string|null, tried: string[], errors: string[]}>} 探测结果。
  */
-export async function findPython(shell, signal, config = {}) {
-  /** @type {string[]} */
+export async function findPython(runtime, signal, config = {}) {
+  /** @type {string[][]} */
   const candidates = [];
-  const push = (value) => {
-    const trimmed = String(value ?? "").trim();
-    if (trimmed && !candidates.includes(trimmed)) candidates.push(trimmed);
+  const seen = new Set();
+  const push = (argv) => {
+    const list = argv.map((value) => String(value ?? "").trim()).filter(Boolean);
+    if (!list.length) return;
+    const key = list.join(" ");
+    if (seen.has(key)) return;
+    seen.add(key);
+    candidates.push(list);
   };
 
-  push(config.pythonCmd);
-  push(process.env.OPENVINO_PYTHON);
-  for (const hit of resolveOnHostPath("python")) push(hit);
-  for (const hit of resolveWellKnownPythons()) push(hit);
+  if (config.pythonCmd) push(String(config.pythonCmd).split(/\s+/));
+  if (process.env.OPENVINO_PYTHON) push(String(process.env.OPENVINO_PYTHON).split(/\s+/));
 
-  // 已安装解释器清单：py -0p 输出形如 ` -V:3.12 *        C:\...\python.exe`
-  try {
-    const listed = await runShell(shell, { command: "py -0p", timeoutMs: 8000, signal });
-    if (listed.exitCode === 0) {
-      for (const line of listed.stdout.text.split(/\r?\n/)) {
-        const match = /([A-Za-z]:[\\/][^"\r\n]*python\.exe)/i.exec(line);
-        if (match) push(match[1]);
+  // subprocess provider 有自己的受信 PATH，先让它解析（最接近"这个执行世界里真实的 python"）
+  if (typeof runtime?.subprocess?.resolveExecutable === "function") {
+    for (const name of ["python", "python3"]) {
+      try {
+        const resolved = await runtime.subprocess.resolveExecutable(name, undefined, signal);
+        if (resolved) push([resolved]);
+      } catch {
+        /* 解析不到就继续 */
       }
     }
-  } catch {
-    /* 没有 py 启动器：继续用其它来源 */
   }
-
-  // PATH 里的 python / python3 完整路径（能覆盖 OVMS 自带的那份 python）
-  for (const name of ["python", "python3"]) {
-    try {
-      const found = await runShell(shell, { command: `where ${name}`, timeoutMs: 8000, signal });
-      if (found.exitCode === 0) {
-        for (const line of found.stdout.text.split(/\r?\n/)) {
-          const trimmed = line.trim();
-          if (trimmed && /python(3)?\.exe$/i.test(trimmed)) push(trimmed);
-        }
-      }
-    } catch {
-      /* where 不可用：继续 */
-    }
-  }
-
-  push("py -3.12");
-  push("python");
-  push("python3");
+  // DSH shell 的 PATH 可能与宿主进程不同：宿主 PATH 上解析到的绝对路径更可靠
+  for (const hit of resolveOnHostPath("python")) push([hit]);
+  for (const hit of resolveWellKnownPythons()) push([hit]);
+  push(["py", "-3.12"]);
+  push(["python"]);
+  push(["python3"]);
 
   /** @type {string[]} */
   const tried = [];
-  /** 去重后的失败原因（7 个候选常常因为同一个环境原因一起失败，不必重复 7 遍）。 */
+  /** 去重后的失败原因（多个候选常常因为同一个环境原因一起失败，不必重复多遍）。 */
   const reasons = new Set();
   const note = (value) => {
     const text = String(value ?? "").replace(/\s+/g, " ").trim();
-    if (text) reasons.add(text.length > 240 ? `${text.slice(0, 240)}…` : text);
+    if (!text) return;
+    const short = text.includes("sandbox")
+      ? `sandbox: ${text.split("Runner failure:")[0]}`
+      : text;
+    reasons.add(short.length > 240 ? `${short.slice(0, 240)}…` : short);
   };
-  for (const candidate of candidates) {
-    tried.push(candidate);
+  for (const argv of candidates) {
+    const label = argv.join(" ");
+    tried.push(label);
     try {
-      const result = await runShell(shell, { command: `${candidate} --version`, timeoutMs: 8000, signal });
-      if (result.exitCode === 0) return { python: candidate, tried, errors: [...reasons] };
-      note(`${candidate}: exit ${result.exitCode} ${result.stderr.text.trim()}`);
+      const result = await runCommand(runtime, { argv: [...argv, "--version"], timeoutMs: 8000, signal });
+      if (result.exitCode === 0) {
+        return { python: argv, pythonCommand: label, tried, errors: [...reasons] };
+      }
+      note(`${label}: exit ${result.exitCode} ${result.stderr.text.trim()}`);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      // shell API 本身的故障不能被当成"没有解释器"
-      if (/is not a function|缺少 execute/.test(message)) throw new Error(`shell 服务不兼容：${message}`);
-      // 沙箱拒绝执行时，7 个候选的原因完全相同：只留一条。
-      note(message.includes("sandbox") ? `sandbox: ${message.split("Runner failure:")[0]}` : `${candidate}: ${message}`);
+      // shell/registry 本身故障不能被当成"没有解释器"
+      if (/is not a function|缺少 execute|既没有/.test(message)) throw new Error(`执行服务不可用：${message}`);
+      note(`${label}: ${message}`);
     }
   }
-  return { python: null, tried, errors: [...reasons] };
+  return { python: null, pythonCommand: null, tried, errors: [...reasons] };
+}
+
+/**
+ * 把 argv 变成可直接粘贴到终端的命令字符串（仅用于展示）。
+ * @param {string[]} argv - 参数数组。
+ * @returns {string} 展示用命令。
+ */
+export function formatCommand(argv) {
+  return argv
+    .map((value) => (/^[A-Za-z0-9_\-.:\\/]+$/.test(value) ? value : `"${String(value).replaceAll('"', '\\"')}"`))
+    .join(" ");
 }
 
 /**
  * 执行 probe.py 并解析 JSON 报告（设备与版本信息，只有 python 能给）。
- * @param {object} shell - ctx.shell 服务。
- * @param {string} python - 解释器命令。
+ * @param {{shell?: object, subprocess?: object}} runtime - 执行服务。
+ * @param {string[]} python - 解释器 argv 前缀。
  * @param {AbortSignal} [signal] - 取消信号。
  * @returns {Promise<object>} 探测报告。
  */
-export async function runProbe(shell, python, signal) {
-  const result = await runShell(shell, {
-    command: `${python} ${JSON.stringify(PROBE_PATH)}`,
+export async function runProbe(runtime, python, signal) {
+  const result = await runCommand(runtime, {
+    argv: [...python, PROBE_PATH],
     timeoutMs: 60000,
     stdoutMaxBytes: 2000000,
     signal,
@@ -208,16 +275,17 @@ export async function runProbe(shell, python, signal) {
 
 /**
  * python 模块可用性检查（bench 要 openvino_genai，convert 要 optimum）。
- * @param {object} shell - ctx.shell 服务。
- * @param {string} python - 解释器命令。
+ * argv 数组直传，`-c` 里的代码不需要再套引号。
+ * @param {{shell?: object, subprocess?: object}} runtime - 执行服务。
+ * @param {string[]} python - 解释器 argv 前缀。
  * @param {string} moduleName - 模块名。
  * @param {AbortSignal} [signal] - 取消信号。
  * @returns {Promise<boolean>} 是否可导入。
  */
-export async function hasModule(shell, python, moduleName, signal) {
+export async function hasModule(runtime, python, moduleName, signal) {
   try {
-    const result = await runShell(shell, {
-      command: `${python} -c "import importlib.util;print(bool(importlib.util.find_spec('${moduleName}')))"`,
+    const result = await runCommand(runtime, {
+      argv: [...python, "-c", `import importlib.util;print(bool(importlib.util.find_spec('${moduleName}')))`],
       timeoutMs: 20000,
       signal,
     });

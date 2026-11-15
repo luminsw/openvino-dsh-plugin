@@ -57,8 +57,9 @@ for (const m of models) {
 }
 
 console.log("\n== python 段（设备/版本，可选）==");
-const probe = await findPython(shell, undefined, {});
-console.log("python:", probe.python ?? `未找到（试过 ${probe.tried.join(" / ")}）`);
+const runtime = { shell }; // 冒烟脚本用本地 exec 桩充当 shell（插件里优先走 ctx.subprocess）
+const probe = await findPython(runtime, undefined, {});
+console.log("python:", probe.pythonCommand ?? `未找到（试过 ${probe.tried.join(" / ")}）`);
 if (probe.errors.length) console.log("原因:", probe.errors.join(" | "));
 if (!probe.python) {
   console.log("SKIP: 没有可用 python，设备与版本信息跳过");
@@ -66,7 +67,7 @@ if (!probe.python) {
   process.exit(0);
 }
 
-const report = await runProbe(shell, probe.python);
+const report = await runProbe(runtime, probe.python);
 console.log("platform:", JSON.stringify(report.platform));
 console.log("openvino:", JSON.stringify(report.openvino));
 console.log("devices:", (report.devices || []).map((d) => `${d.id}=${d.fullName}`).join(", ") || "无");

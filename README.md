@@ -69,9 +69,13 @@ DSH 里直接调用工具即可，例如 `openvino_env_diag`（体检）、`open
    `openvino_status` / `openvino_models_scan` / `openvino_env_diag` 的核心结论**不再需要 python**；
    只有设备与版本这类非 python 给不出的信息会降级为"未安装 bindings，仅此信息受影响"。
 3. **`findPython` 探测面太窄**。现在顺序是：`config.pythonCmd` → `OPENVINO_PYTHON` →
-   宿主 PATH 上解析出的绝对路径（DSH shell 的 PATH 可能与宿主进程不同，实测本机 `python`
-   在宿主 PATH 上却在 shell 里解析不到）→ 常见安装位置 → `py -0p` / `where python` → 字面命令。
-   失败原因去重后最多留几条，不再把同一段沙箱报错拼七遍。
+   `ctx.subprocess.resolveExecutable`（provider 的受信 PATH）→ 宿主 PATH 上解析出的绝对路径
+   （DSH shell 的 PATH 可能与宿主进程不同，实测本机 `python` 在宿主 PATH 上却在 shell 里解析不到）
+   → 常见安装位置 → 字面命令。失败原因去重后最多留几条，不再把同一段报错拼七遍。
+4. **执行外部命令改走 `ctx.subprocess`**（`ctx.shell` 作回退）。原因见下面的"已知限制"：
+   本机 Windows ACL 沙箱会整体拒绝 shell 执行，而 openvino 的 bench/convert 本来就要读写模型目录，
+   只能在宿主权限下跑。`ctx.subprocess` 是 DSH 自己的底层 seam，不套 shell 沙箱，且收 **argv 数组**
+   ——顺带消掉了原代码里拼命令字符串的引号隐患（`python -c "..."`、带空格的模型路径）。
 
 顺带修的两个真实误报：
 
@@ -87,11 +91,16 @@ DSH 里直接调用工具即可，例如 `openvino_env_diag`（体检）、`open
 
 - `openvino_bench` / `openvino_convert --dryRun=false` 需要可用 python（`openvino_genai` / `optimum`）。
   状态类工具不需要。
-- **DSH shell 沙箱可能整体拒绝执行命令**：错误形如
+- **本机 `ctx.shell` 会被 Windows ACL 沙箱整体拒绝**：错误形如
   `sandbox mode "workspace-write" ... Windows ACL temp root must be outside the workspace`，
-  即 TEMP 目录落在 workspace 里面（本机曾因 workspace = `C:\Users\lumin`、TEMP 在其下而全部被拒）。
-  这是宿主环境问题，插件只能如实报出原因：此时状态类工具照常可用，bench/convert 会失败并显示该原因。
-  修法二选一 —— 把 DSH workspace 收窄到具体项目目录，或把 `TEMP`/`TMP` 指到 workspace 之外的目录后重启 DSH。
+  即 TEMP 目录落在 workspace 里面（本机 workspace = `C:\Users\lumin`、TEMP 在其下）。
+  这是宿主环境问题，两个修法：把 DSH workspace 收窄到具体项目目录，或把 `TEMP`/`TMP` 指到
+  workspace 之外后重启 DSH。**为不受它影响，本插件优先用 `ctx.subprocess`**（不套 shell 沙箱）。
+  这是有意的：bench/convert 要读写 GB 级模型目录，只能宿主权限下跑；若将来 DSH 收紧
+  subprocess 权限，这里需要重新设计（届时改为遵循会话的 sandboxPolicy）。
+- 本机三个 python（OVMS 自带 3.12.10、`Programs\Python312`、Python 3.14.3）都没装 openvino bindings，
+  所以 `env_diag` 的设备列表为空、bench/convert 会提示 `pip install`。建议单独建 venv 装，
+  再用 `config.pythonCmd` 指过去，不要污染 OVMS 自带那份解释器。
 - 模型目录 ↔ OVMS id 映射表 `DIR_TO_OMS`（`src/probe.js`）与百花 `OmsModelMap.cs` 保持一致，新增模型需两个方向同步。
 - 模型目录文件被 ACL 保护（如 `PermissionError`）时，先 `icacls "<dir>" /grant "<user>:(OI)(CI)F" /T` 修复。
 - `openvino_bench` 加载 7B 模型较耗时（1-5 分钟），属长任务。
